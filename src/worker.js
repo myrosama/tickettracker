@@ -30,10 +30,10 @@ SV / СВ
 You can choose multiple types by separating them with commas, or type any to match all available tickets.`;
 
 const POPULAR_STATIONS = [
-  "Toshkent", "Samarqand", "Buxoro", "Urganch",
-  "Nukus", "Xiva", "Farg'ona", "Andijon",
+  "Toshkent", "Samarqand", "Buxoro", "Urgench",
+  "Nukus", "Xiva", "Фергана", "Andijon",
   "Namangan", "Qarshi", "Termiz", "Navoiy",
-  "Jizzax", "Guliston", "Marg'ilon", "Qo'ng'irot",
+  "Jizzax", "Guliston", "Margilan", "Kungrad",
 ];
 
 const CAR_TYPE_ALIASES = {
@@ -149,19 +149,31 @@ async function handleWizardMessage(env, chatId, textValue, row) {
   const data = JSON.parse(row.data_json || "{}");
   if (row.state === "awaiting_from" || row.state === "awaiting_to") {
     const isFrom = row.state === "awaiting_from";
+    const excludeLabel = isFrom ? null : data.fromLabel;
     const picked = await pickStation(env, textValue);
     if (!picked) {
-      await sendMessage(env, chatId, `No stations found for "${escapeHtml(textValue)}". Try a different spelling or tap a button:`, stationKeyboard());
+      await sendMessage(env, chatId, `No stations found for "${escapeHtml(textValue)}". Try a different spelling or tap a button:`, stationKeyboard(null, excludeLabel));
       return;
     }
     if (picked.matches) {
-      await sendMessage(env, chatId, "Several stations match. Tap the right one:", stationKeyboard(picked.matches.map((s) => `${s.code} - ${s.name}`)));
+      let matches = picked.matches;
+      if (!isFrom && data.fromStation) matches = matches.filter((s) => String(s.code) !== String(data.fromStation.code));
+      if (!matches.length) {
+        await sendMessage(env, chatId, "That only matches the departure station. Pick a different arrival station:", stationKeyboard(null, excludeLabel));
+        return;
+      }
+      await sendMessage(env, chatId, "Several stations match. Tap the right one:", stationKeyboard(matches.map((s) => `${s.code} - ${s.name}`)));
+      return;
+    }
+    if (!isFrom && data.fromStation && String(picked.code) === String(data.fromStation.code)) {
+      await sendMessage(env, chatId, "Arrival station can't be the same as the departure station. Pick a different one:", stationKeyboard(null, excludeLabel));
       return;
     }
     data[isFrom ? "fromStation" : "toStation"] = { code: String(picked.code), name: String(picked.name) };
     if (isFrom) {
+      data.fromLabel = textValue.trim();
       await setState(env, chatId, "awaiting_to", data);
-      await sendMessage(env, chatId, `From: ${escapeHtml(picked.name)}\nNow pick the arrival station, or type its name:`, stationKeyboard());
+      await sendMessage(env, chatId, `From: ${escapeHtml(picked.name)}\nNow pick the arrival station, or type its name:`, stationKeyboard(null, data.fromLabel));
     } else {
       await setState(env, chatId, "awaiting_dates", data);
       await sendMessage(env, chatId, `To: ${escapeHtml(picked.name)}\nSend one or more dates. Examples:\n2026-08-18\n2026-08-18, 2026-08-20\n2026-08-18..2026-08-21\ntomorrow`, dateKeyboard());
@@ -275,12 +287,14 @@ async function eticketPost(env, session, path, payload, extraHeaders = {}) {
   });
   const textValue = await res.text();
   if (!res.ok) throw new Error(`eticket ${res.status}: ${textValue.slice(0, 300)}`);
+  if (!textValue) return null; // eticket returns 204 with empty body when nothing matches
   return JSON.parse(textValue);
 }
 
 async function searchStations(env, name) {
   const session = await createEticketSession(env);
   const result = await eticketPost(env, session, "/api/v1/handbook/stations/list", { name });
+  if (!result) return [];
   if (result.error) throw new Error(`station lookup failed: ${JSON.stringify(result.error)}`);
   return result.data?.stations || [];
 }
@@ -316,6 +330,7 @@ async function findTrains(env, session, fromCode, toCode, travelDate) {
       },
     },
   }, { "X-Custom-Language": env.ETICKET_LANGUAGE || "ru" });
+  if (!result) return [];
   if (result.error) throw new Error(`train lookup failed: ${JSON.stringify(result.error)}`);
   return result.data?.directions?.forward?.trains || [];
 }
@@ -538,8 +553,12 @@ function mainKeyboard() {
   return { keyboard: [[{ text: "/newtracker" }, { text: "/list" }], [{ text: "/types" }, { text: "/cancel" }]], resize_keyboard: true };
 }
 
-function stationKeyboard(labels) {
-  const buttons = labels && labels.length ? labels : POPULAR_STATIONS;
+function stationKeyboard(labels, excludeLabel) {
+  let buttons = labels && labels.length ? labels : POPULAR_STATIONS;
+  if (excludeLabel) {
+    const excluded = normalizeType(excludeLabel);
+    buttons = buttons.filter((label) => normalizeType(label) !== excluded);
+  }
   const rows = [];
   for (let index = 0; index < buttons.length; index += 2) {
     rows.push(buttons.slice(index, index + 2).map((label) => ({ text: label })));
