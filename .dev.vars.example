@@ -1,0 +1,6 @@
+TELEGRAM_BOT_TOKEN=replace_me
+WEBHOOK_SECRET=replace_with_random_secret
+ADMIN_SECRET=replace_with_random_secret
+ETICKET_SITE_URL=https://eticket.railway.uz
+ETICKET_LANGUAGE=ru
+CHECK_LIMIT=20

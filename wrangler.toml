@@ -1,0 +1,16 @@
+name = "tickettracker"
+main = "src/worker.js"
+compatibility_date = "2026-08-17"
+
+[vars]
+ETICKET_SITE_URL = "https://eticket.railway.uz"
+ETICKET_LANGUAGE = "ru"
+CHECK_LIMIT = "20"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "tickettracker"
+database_id = "af86b7bf-3653-4768-82db-5472b64c201a"
+
+[triggers]
+crons = ["*/1 * * * *"]
