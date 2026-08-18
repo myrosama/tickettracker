@@ -427,7 +427,7 @@ async function checkTrackers(env) {
       } else {
         const lastAt = row.last_error_at ? Date.parse(row.last_error_at) : 0;
         if (!lastAt || Date.now() - lastAt > ERROR_NOTIFY_COOLDOWN_MS) {
-          await sendMessage(env, row.chat_id, `⚠️ <b>Tracker #${row.id}</b>\n${escapeHtml(prettifyError(message))}`);
+          await sendMessage(env, row.chat_id, `⚠️ <b>${escapeHtml(row.from_name)} → ${escapeHtml(row.to_name)}</b>\n${escapeHtml(prettifyError(message))}`);
           await env.DB.prepare("UPDATE trackers SET last_checked_at = ?, last_error = ?, last_error_at = ? WHERE id = ?").bind(nowIso, message, nowIso, row.id).run();
         } else {
           await env.DB.prepare("UPDATE trackers SET last_checked_at = ?, last_error = ? WHERE id = ?").bind(nowIso, message, row.id).run();
@@ -702,7 +702,7 @@ async function renderConsolidated(env, tracker, dates, types, cache) {
     if (matches.length > 8) sections.push(`  …and ${matches.length - 8} more`);
     sections.push("");
   }
-  sections.push(`🔄 Updated ${stamp} · Tracker #${tracker.id}`);
+  sections.push(`🔄 Updated ${stamp}`);
   const fingerprint = dates.map((d) => {
     const m = byDate.get(d);
     return m ? m.map((x) => `${x.key}#${x.freeSeats}`).join(";") : "";
