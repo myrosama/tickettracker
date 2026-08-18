@@ -309,7 +309,7 @@ async function sendTrackerList(env, chatId, editMessageId) {
   const markup = keyboard.length ? { inline_keyboard: keyboard } : undefined;
   const msg = parts.join("\n");
   if (editMessageId) return editMessage(env, chatId, editMessageId, msg, markup);
-  return sendMessage(env, chatId, msg, mainKeyboard());
+  return sendMessage(env, chatId, msg, markup);
 }
 
 async function refreshAlert(env, cb, chatId, trackerId) {
@@ -320,6 +320,7 @@ async function refreshAlert(env, cb, chatId, trackerId) {
   const dates = trackerDates(tracker);
   const types = trackerTypes(tracker);
   const rendered = await renderConsolidated(env, session, tracker, dates, types);
+  const hasTickets = rendered.fingerprint.length > 0;
   const stored = await env.DB.prepare("SELECT * FROM alert_messages WHERE tracker_id = ? AND travel_date = ''").bind(trackerId).first();
   if (stored && stored.content === rendered.text) {
     await answerCallback(env, cb.id, "✅ Already up to date");
@@ -331,8 +332,8 @@ async function refreshAlert(env, cb, chatId, trackerId) {
     if (/not modified/i.test(editErr.message)) { await answerCallback(env, cb.id, "✅ Already up to date"); return; }
     throw editErr;
   }
-  await saveAlertMessage(env, trackerId, "", cb.message.message_id, rendered);
-  await answerCallback(env, cb.id, "✅ Updated");
+  await saveAlertMessage(env, trackerId, "", cb.message.message_id, rendered, hasTickets);
+  await answerCallback(env, cb.id, hasTickets ? "✅ Updated — tickets available" : "✅ Updated — no tickets right now");
 }
 
 async function addTrackerFromParsed(env, chatId, parsed) {
@@ -372,22 +373,23 @@ async function checkTrackers(env) {
       const dates = trackerDates(row);
       const types = trackerTypes(row);
       const rendered = await renderConsolidated(env, session, row, dates, types);
+      const hasTickets = rendered.fingerprint.length > 0;
       const stored = await env.DB.prepare("SELECT * FROM alert_messages WHERE tracker_id = ? AND travel_date = ''").bind(row.id).first();
-      if (!stored) {
-        const sent = await sendMessage(env, row.chat_id, rendered.text, refreshKeyboard(row.id));
-        await saveAlertMessage(env, row.id, "", sent.message_id, rendered);
-      } else if (stored.content !== rendered.text) {
+      const prevHadTickets = stored ? Boolean(stored.has_tickets) : null;
+      if (prevHadTickets === null) {
         try {
-          await editMessage(env, row.chat_id, stored.message_id, rendered.text, refreshKeyboard(row.id));
-        } catch (editErr) {
-          if (/not modified/i.test(editErr.message)) { /* no-op */ } else { console.error("alert edit failed:", editErr.message); }
+          const sent = await sendMessage(env, row.chat_id, rendered.text, refreshKeyboard(row.id));
+          await saveAlertMessage(env, row.id, "", sent.message_id, rendered, hasTickets);
+        } catch (sendErr) {
+          console.error("first alert send failed:", sendErr.message);
         }
-        await saveAlertMessage(env, row.id, "", stored.message_id, rendered);
-      } else if (Date.now() - Date.parse(stored.updated_at) > ALERT_REFRESH_MS) {
+      } else if (prevHadTickets !== hasTickets) {
         try {
-          await editMessage(env, row.chat_id, stored.message_id, rendered.text, refreshKeyboard(row.id));
-        } catch (_e) { /* no-op */ }
-        await saveAlertMessage(env, row.id, "", stored.message_id, rendered);
+          const sent = await sendMessage(env, row.chat_id, rendered.text, refreshKeyboard(row.id));
+          await saveAlertMessage(env, row.id, "", sent.message_id, rendered, hasTickets);
+        } catch (sendErr) {
+          console.error("status change notify failed:", sendErr.message);
+        }
       }
       await env.DB.prepare("UPDATE trackers SET last_checked_at = ?, last_error = NULL, last_error_at = NULL WHERE id = ?").bind(nowIso, row.id).run();
     } catch (err) {
@@ -714,12 +716,12 @@ function shortTime(value) {
   return m ? m[1] : String(value || "");
 }
 
-async function saveAlertMessage(env, trackerId, travelDate, messageId, rendered) {
+async function saveAlertMessage(env, trackerId, travelDate, messageId, rendered, hasTickets) {
   await env.DB.prepare(`
-    INSERT INTO alert_messages (tracker_id, travel_date, message_id, fingerprint, content, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(tracker_id, travel_date) DO UPDATE SET message_id = excluded.message_id, fingerprint = excluded.fingerprint, content = excluded.content, updated_at = excluded.updated_at
-  `).bind(trackerId, travelDate, messageId, rendered.fingerprint, rendered.text, new Date().toISOString()).run();
+    INSERT INTO alert_messages (tracker_id, travel_date, message_id, fingerprint, content, updated_at, has_tickets)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(tracker_id, travel_date) DO UPDATE SET message_id = excluded.message_id, fingerprint = excluded.fingerprint, content = excluded.content, updated_at = excluded.updated_at, has_tickets = excluded.has_tickets
+  `).bind(trackerId, travelDate, messageId, rendered.fingerprint, rendered.text, new Date().toISOString(), hasTickets ? 1 : 0).run();
 }
 
 async function getState(env, chatId) {

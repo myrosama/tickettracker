@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS alert_messages (
   fingerprint TEXT NOT NULL,
   content TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  has_tickets INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (tracker_id, travel_date)
 );
 
