@@ -232,8 +232,8 @@ async function handleCallback(cb, env) {
   const [action, a1, a2] = String(cb.data || "").split("|");
 
   try {
-    if (action === "r") {
-      await refreshAlert(env, cb, chatId, Number(a1), a2);
+    if (action === "v") {
+      await refreshAlert(env, cb, chatId, Number(a1));
       return;
     }
     if (action === "d") {
@@ -301,6 +301,7 @@ async function sendTrackerList(env, chatId, editMessageId) {
   }
 
   const keyboard = active.map((r) => ([
+    { text: `🔍 View #${r.id}`, callback_data: `v|${r.id}` },
     { text: `✏️ Edit #${r.id}`, callback_data: `e|${r.id}` },
     { text: `🗑 Delete #${r.id}`, callback_data: `d|${r.id}` },
   ]));
@@ -311,27 +312,27 @@ async function sendTrackerList(env, chatId, editMessageId) {
   return sendMessage(env, chatId, msg, mainKeyboard());
 }
 
-async function refreshAlert(env, cb, chatId, trackerId, travelDate) {
+async function refreshAlert(env, cb, chatId, trackerId) {
   const tracker = await env.DB.prepare("SELECT * FROM trackers WHERE id = ? AND chat_id = ?").bind(trackerId, chatId).first();
   if (!tracker) return answerCallback(env, cb.id, "⚠️ Tracker not found");
   if (tracker.archived) return answerCallback(env, cb.id, "🗄 Tracker is archived");
   const session = await createEticketSession(env);
-  const trains = await findTrains(env, session, tracker.from_code, tracker.to_code, travelDate);
-  const matches = collectAvailability(trains, trackerTypes(tracker));
-  const rendered = renderAlert(tracker, travelDate, matches);
-  const stored = await env.DB.prepare("SELECT * FROM alert_messages WHERE tracker_id = ? AND travel_date = ?").bind(trackerId, travelDate).first();
+  const dates = trackerDates(tracker);
+  const types = trackerTypes(tracker);
+  const rendered = await renderConsolidated(env, session, tracker, dates, types);
+  const stored = await env.DB.prepare("SELECT * FROM alert_messages WHERE tracker_id = ? AND travel_date = ''").bind(trackerId).first();
   if (stored && stored.content === rendered.text) {
     await answerCallback(env, cb.id, "✅ Already up to date");
     return;
   }
   try {
-    await editMessage(env, chatId, cb.message.message_id, rendered.text, refreshKeyboard(trackerId, travelDate));
+    await editMessage(env, chatId, cb.message.message_id, rendered.text, refreshKeyboard(trackerId));
   } catch (editErr) {
     if (/not modified/i.test(editErr.message)) { await answerCallback(env, cb.id, "✅ Already up to date"); return; }
     throw editErr;
   }
-  await saveAlertMessage(env, trackerId, travelDate, cb.message.message_id, rendered);
-  await answerCallback(env, cb.id, matches.length ? "✅ Updated" : "Updated — no tickets right now");
+  await saveAlertMessage(env, trackerId, "", cb.message.message_id, rendered);
+  await answerCallback(env, cb.id, "✅ Updated");
 }
 
 async function addTrackerFromParsed(env, chatId, parsed) {
@@ -370,30 +371,23 @@ async function checkTrackers(env) {
     try {
       const dates = trackerDates(row);
       const types = trackerTypes(row);
-      for (const travelDate of dates) {
-        const trains = await findTrains(env, session, row.from_code, row.to_code, travelDate);
-        const matches = collectAvailability(trains, types);
-        const rendered = renderAlert(row, travelDate, matches);
-        const stored = await env.DB.prepare("SELECT * FROM alert_messages WHERE tracker_id = ? AND travel_date = ?").bind(row.id, travelDate).first();
-        if (!stored) {
-          if (matches.length) {
-            try {
-              const sent = await sendMessage(env, row.chat_id, rendered.text, refreshKeyboard(row.id, travelDate));
-              await saveAlertMessage(env, row.id, travelDate, sent.message_id, rendered);
-            } catch (sendErr) {
-              console.error("alert send failed:", sendErr.message);
-            }
-          }
-        } else if (stored.fingerprint !== rendered.fingerprint || Date.now() - Date.parse(stored.updated_at) > ALERT_REFRESH_MS) {
-          if (stored.content !== rendered.text) {
-            try {
-              await editMessage(env, row.chat_id, stored.message_id, rendered.text, refreshKeyboard(row.id, travelDate));
-            } catch (editErr) {
-              if (/not modified/i.test(editErr.message)) { /* no-op */ } else { console.error("alert edit failed:", editErr.message); }
-            }
-          }
-          await saveAlertMessage(env, row.id, travelDate, stored.message_id, rendered);
+      const rendered = await renderConsolidated(env, session, row, dates, types);
+      const stored = await env.DB.prepare("SELECT * FROM alert_messages WHERE tracker_id = ? AND travel_date = ''").bind(row.id).first();
+      if (!stored) {
+        const sent = await sendMessage(env, row.chat_id, rendered.text, refreshKeyboard(row.id));
+        await saveAlertMessage(env, row.id, "", sent.message_id, rendered);
+      } else if (stored.content !== rendered.text) {
+        try {
+          await editMessage(env, row.chat_id, stored.message_id, rendered.text, refreshKeyboard(row.id));
+        } catch (editErr) {
+          if (/not modified/i.test(editErr.message)) { /* no-op */ } else { console.error("alert edit failed:", editErr.message); }
         }
+        await saveAlertMessage(env, row.id, "", stored.message_id, rendered);
+      } else if (Date.now() - Date.parse(stored.updated_at) > ALERT_REFRESH_MS) {
+        try {
+          await editMessage(env, row.chat_id, stored.message_id, rendered.text, refreshKeyboard(row.id));
+        } catch (_e) { /* no-op */ }
+        await saveAlertMessage(env, row.id, "", stored.message_id, rendered);
       }
       await env.DB.prepare("UPDATE trackers SET last_checked_at = ?, last_error = NULL, last_error_at = NULL WHERE id = ?").bind(nowIso, row.id).run();
     } catch (err) {
@@ -660,6 +654,49 @@ function renderAlert(row, travelDate, matches) {
   return { text, fingerprint };
 }
 
+async function renderConsolidated(env, session, tracker, dates, types) {
+  const sections = [];
+  let totalMatches = 0;
+  const byDate = new Map();
+  for (const travelDate of dates) {
+    const trains = await findTrains(env, session, tracker.from_code, tracker.to_code, travelDate);
+    const matches = collectAvailability(trains, types);
+    if (matches.length) byDate.set(travelDate, matches);
+    totalMatches += matches.length;
+  }
+  const stamp = new Date().toISOString().slice(11, 16);
+  const header = totalMatches ? "🟢 <b>Tickets available</b>" : "🔴 <b>No tickets right now</b>";
+  sections.push(header, `🚂 ${escapeHtml(tracker.from_name)} → ${escapeHtml(tracker.to_name)}`, "");
+  for (const travelDate of dates) {
+    const matches = byDate.get(travelDate);
+    sections.push(`<b>📅 ${travelDate}</b>`);
+    if (!matches) {
+      sections.push("  ❌ No tickets", "");
+      continue;
+    }
+    for (const item of matches.slice(0, 8)) {
+      const tariffLines = (item.tariffs || []).slice(0, 3).map((t) => {
+        let s = String(t.classServiceType || "class");
+        if (t.freeSeats !== undefined) s += `: ${t.freeSeats}`;
+        if (t.tariff !== undefined && Number.isFinite(Number(t.tariff))) s += ` • ${Number(t.tariff).toLocaleString("en-US")} UZS`;
+        return s;
+      });
+      sections.push(`  <b>${escapeHtml(item.trainNumber)}</b>${item.brand ? ` • ${escapeHtml(item.brand)}` : ""}`);
+      sections.push(`  🪑 ${escapeHtml(item.carType)} — <b>${item.freeSeats}</b> free`);
+      if (tariffLines.length) sections.push(`  💰 ${escapeHtml(tariffLines.join("  ·  "))}`);
+    }
+    if (matches.length > 8) sections.push(`  …and ${matches.length - 8} more`);
+    sections.push("");
+  }
+  sections.push(`🔄 Updated ${stamp} UTC · Tracker #${tracker.id}`);
+  const fingerprint = dates.map((d) => {
+    const m = byDate.get(d);
+    return m ? m.map((x) => `${x.key}#${x.freeSeats}`).join(";") : "";
+  }).join("|");
+  const text = sections.join("\n").trim();
+  return { text, fingerprint };
+}
+
 function prettifyError(message) {
   const jsonStart = message.indexOf("{");
   if (jsonStart > 0) {
@@ -744,7 +781,7 @@ async function answerCallback(env, callbackId, textValue) {
 }
 
 function refreshKeyboard(trackerId, travelDate) {
-  return { inline_keyboard: [[{ text: "🔄 Refresh", callback_data: `r|${trackerId}|${travelDate}` }]] };
+  return { inline_keyboard: [[{ text: "🔄 Refresh", callback_data: `v|${trackerId}` }]] };
 }
 
 function mainKeyboard() {
