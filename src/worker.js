@@ -1,33 +1,35 @@
 const DEFAULT_SITE_URL = "https://eticket.railway.uz";
 const MAX_TRACK_DATES = 30;
 const DEFAULT_CHECK_LIMIT = 20;
+const ERROR_NOTIFY_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const ALERT_REFRESH_MS = 24 * 60 * 60 * 1000;
 
-const HELP_TEXT = `I can watch eticket.railway.uz and message you when matching train tickets appear.
+const HELP_TEXT = `🚂 <b>Ticket Tracker</b>
 
-Commands:
-/newtracker - create a tracker step by step
-/track FROM -> TO [DATE] [days=N] [dates=D1,D2] [types=TYPE1,TYPE2]
-/list - show active trackers
-/stop ID - stop one tracker
-/stop_all - stop all trackers
-/stations QUERY - find station codes
-/types - common ticket type names
-/cancel - cancel setup
+I watch <b>eticket.railway.uz</b> and message you when matching train tickets appear.
 
-Examples:
-/track Tashkent -> Samarkand 2026-08-18 days=3 types=Kupe,SV
-/track Toshkent -> Buxoro dates=2026-08-18,2026-08-20 types=O'rindiqli,Kupe
-/track 2900000 -> 2900700 tomorrow types=Сидячий
+<b>Commands</b>
+/newtracker — create a tracker (guided step by step)
+/list — your trackers (edit/delete via buttons)
+/track — quick create:
+<code>/track Tashkent -> Samarkand 2026-08-18 days=3 types=Kupe,SV</code>
+/stations QUERY — find station codes
+/types — common ticket type names
+/stop ID — pause a tracker
+/stop_all — pause all trackers
+/cancel — cancel current setup
 
-Use /newtracker for the normal guided flow.`;
+Notifications update in place — no spam.
+Tap 🔄 Refresh on any alert to re-check instantly.`;
 
-const TYPE_HELP = `Common type filters you can use:
-O'rindiqli / Сидячий / seated
-Kupe / Купе / coupe
-Plaskartli / Плацкартный / platskart
-SV / СВ
+const TYPE_HELP = `<b>Ticket types you can filter on:</b>
 
-You can choose multiple types by separating them with commas, or type any to match all available tickets.`;
+🪑 O'rindiqli / Сидячий / seated
+🛏 Kupe / Купе / coupe
+🛋 Plaskartli / Плацкартный / platskart
+👑 SV / СВ
+
+Separate multiple types with commas, or type <b>any</b> for all.`;
 
 const POPULAR_STATIONS = [
   "Toshkent", "Samarqand", "Buxoro", "Urgench",
@@ -61,9 +63,18 @@ export default {
 async function telegramWebhook(request, env, ctx) {
   if (request.method !== "POST") return text("method not allowed", 405);
   const update = await request.json();
+  if (update.callback_query) {
+    try {
+      await handleCallback(update.callback_query, env);
+      console.log("callback handled:", update.callback_query.data);
+    } catch (err) {
+      console.error("handleCallback failed:", (err && err.stack) || String(err));
+    }
+    return json({ ok: true });
+  }
   try {
     await handleUpdate(update, env);
-    console.log("update handled ok:", update.message && update.message.text);
+    console.log("update handled:", update.message && update.message.text);
   } catch (err) {
     console.error("handleUpdate failed:", (err && err.stack) || String(err));
   }
@@ -78,7 +89,7 @@ async function setupWebhook(request, env) {
   const webhookUrl = `${url.origin}${webhookPath(env)}`;
   const result = await telegramApi(env, "setWebhook", {
     url: webhookUrl,
-    allowed_updates: JSON.stringify(["message"]),
+    allowed_updates: JSON.stringify(["message", "callback_query"]),
   });
   return json({ ok: true, webhookUrl, result });
 }
@@ -97,7 +108,7 @@ async function handleUpdate(update, env) {
   try {
     if (command === "/cancel") {
       await clearState(env, chatId);
-      await sendMessage(env, chatId, "Setup cancelled.", mainKeyboard());
+      await sendMessage(env, chatId, "Cancelled.", mainKeyboard());
       return;
     }
 
@@ -118,30 +129,28 @@ async function handleUpdate(update, env) {
       const query = textValue.replace(/^\/stations(?:@\w+)?\s*/i, "").trim();
       if (!query) return sendMessage(env, chatId, "Use: /stations QUERY");
       const stations = await searchStations(env, query);
-      const lines = stations.slice(0, 20).map((s) => `${escapeHtml(s.code)} - ${escapeHtml(s.name)}`);
-      await sendMessage(env, chatId, lines.length ? lines.join("\n") : "No stations found.");
+      const lines = stations.slice(0, 20).map((s) => `${escapeHtml(s.code)} — ${escapeHtml(s.name)}`);
+      await sendMessage(env, chatId, lines.length ? `📍 <b>Stations matching "${escapeHtml(query)}"</b>\n\n` + lines.join("\n") : "No stations found.", mainKeyboard());
     } else if (command === "/track") {
       const parsed = parseTrackCommand(textValue);
       await addTrackerFromParsed(env, chatId, parsed);
     } else if (command === "/list") {
-      const rows = await env.DB.prepare("SELECT * FROM trackers WHERE chat_id = ? AND active = 1 ORDER BY id").bind(chatId).all();
-      if (!rows.results.length) return sendMessage(env, chatId, "No active trackers.", mainKeyboard());
-      await sendMessage(env, chatId, rows.results.map(formatTracker).join("\n"), mainKeyboard());
+      await sendTrackerList(env, chatId);
     } else if (command === "/stop") {
       const parts = textValue.split(/\s+/);
       if (parts.length !== 2 || !/^\d+$/.test(parts[1])) return sendMessage(env, chatId, "Use: /stop ID");
       const result = await env.DB.prepare("UPDATE trackers SET active = 0 WHERE chat_id = ? AND id = ? AND active = 1").bind(chatId, Number(parts[1])).run();
-      await sendMessage(env, chatId, result.meta.changes ? "Stopped." : "Tracker not found.", mainKeyboard());
+      await sendMessage(env, chatId, result.meta.changes ? `⏸ Tracker #${parts[1]} paused.` : "Tracker not found.", mainKeyboard());
     } else if (command === "/stop_all") {
       const result = await env.DB.prepare("UPDATE trackers SET active = 0 WHERE chat_id = ? AND active = 1").bind(chatId).run();
-      await sendMessage(env, chatId, `Stopped ${result.meta.changes || 0} tracker(s).`, mainKeyboard());
+      await sendMessage(env, chatId, `⏸ Paused ${result.meta.changes || 0} tracker(s).`, mainKeyboard());
     } else if (state) {
-      await sendMessage(env, chatId, "Continue setup by answering the current question, or use /cancel.");
+      await sendMessage(env, chatId, "Continue by answering the current step, or /cancel to abort.", stateKeyboard());
     } else {
       await sendMessage(env, chatId, HELP_TEXT, mainKeyboard());
     }
   } catch (err) {
-    await sendMessage(env, chatId, `Error: ${escapeHtml(err.message || String(err))}`);
+    await sendMessage(env, chatId, `⚠️ ${escapeHtml(err.message || String(err))}`);
   }
 }
 
@@ -152,38 +161,38 @@ async function handleWizardMessage(env, chatId, textValue, row) {
     const excludeLabel = isFrom ? null : data.fromLabel;
     const picked = await pickStation(env, textValue);
     if (!picked) {
-      await sendMessage(env, chatId, `No stations found for "${escapeHtml(textValue)}". Try a different spelling or tap a button:`, stationKeyboard(null, excludeLabel));
+      await sendMessage(env, chatId, `❌ No stations found for "${escapeHtml(textValue)}". Try another spelling or tap a button:`, stationKeyboard(null, excludeLabel));
       return;
     }
     if (picked.matches) {
       let matches = picked.matches;
       if (!isFrom && data.fromStation) matches = matches.filter((s) => String(s.code) !== String(data.fromStation.code));
       if (!matches.length) {
-        await sendMessage(env, chatId, "That only matches the departure station. Pick a different arrival station:", stationKeyboard(null, excludeLabel));
+        await sendMessage(env, chatId, "That only matches the departure station. Pick a different arrival:", stationKeyboard(null, excludeLabel));
         return;
       }
-      await sendMessage(env, chatId, "Several stations match. Tap the right one:", stationKeyboard(matches.map((s) => `${s.code} - ${s.name}`)));
+      await sendMessage(env, chatId, "Several stations match — tap the right one:", stationKeyboard(matches.map((s) => `${s.code} - ${s.name}`)));
       return;
     }
     if (!isFrom && data.fromStation && String(picked.code) === String(data.fromStation.code)) {
-      await sendMessage(env, chatId, "Arrival station can't be the same as the departure station. Pick a different one:", stationKeyboard(null, excludeLabel));
+      await sendMessage(env, chatId, "⚠️ Arrival can't be the same as departure. Pick a different station:", stationKeyboard(null, excludeLabel));
       return;
     }
     data[isFrom ? "fromStation" : "toStation"] = { code: String(picked.code), name: String(picked.name) };
     if (isFrom) {
       data.fromLabel = textValue.trim();
       await setState(env, chatId, "awaiting_to", data);
-      await sendMessage(env, chatId, `From: ${escapeHtml(picked.name)}\nNow pick the arrival station, or type its name:`, stationKeyboard(null, data.fromLabel));
+      await sendMessage(env, chatId, `✅ From: <b>${escapeHtml(picked.name)}</b>\n\nNow pick the arrival station:`, stationKeyboard(null, data.fromLabel));
     } else {
       await setState(env, chatId, "awaiting_dates", data);
-      await sendMessage(env, chatId, `To: ${escapeHtml(picked.name)}\nSend one or more dates. Examples:\n2026-08-18\n2026-08-18, 2026-08-20\n2026-08-18..2026-08-21\ntomorrow`, dateKeyboard());
+      await sendMessage(env, chatId, `✅ To: <b>${escapeHtml(picked.name)}</b>\n\nSend one or more dates:`, dateKeyboard());
     }
     return;
   }
   if (row.state === "awaiting_dates") {
     data.dates = parseDatesSpec(textValue);
     await setState(env, chatId, "awaiting_types", data);
-    await sendMessage(env, chatId, `Send ticket types separated by commas, or any.\n\n${TYPE_HELP}`, typeKeyboard());
+    await sendMessage(env, chatId, `✅ Dates: <b>${escapeHtml(formatDates(data.dates))}</b>\n\nSend ticket types separated by commas, or <b>any</b> for all:`, typeKeyboard());
     return;
   }
   if (row.state === "awaiting_types") {
@@ -192,7 +201,137 @@ async function handleWizardMessage(env, chatId, textValue, row) {
     await clearState(env, chatId);
     return;
   }
+  if (row.state === "awaiting_edit_dates") {
+    const trackerId = Number(data.trackerId);
+    const tracker = await env.DB.prepare("SELECT * FROM trackers WHERE id = ? AND chat_id = ?").bind(trackerId, chatId).first();
+    if (!tracker) { await clearState(env, chatId); return sendMessage(env, chatId, "⚠️ Tracker not found.", mainKeyboard()); }
+    const dates = parseDatesSpec(textValue);
+    await env.DB.prepare("UPDATE trackers SET dates_json = ?, active = 1, archived = 0 WHERE id = ?").bind(JSON.stringify(dates), trackerId).run();
+    const updated = await env.DB.prepare("SELECT * FROM trackers WHERE id = ?").bind(trackerId).first();
+    await clearState(env, chatId);
+    await sendMessage(env, chatId, `✅ Dates updated!\n\n${formatTracker(updated)}`, mainKeyboard());
+    return;
+  }
+  if (row.state === "awaiting_edit_types") {
+    const trackerId = Number(data.trackerId);
+    const tracker = await env.DB.prepare("SELECT * FROM trackers WHERE id = ? AND chat_id = ?").bind(trackerId, chatId).first();
+    if (!tracker) { await clearState(env, chatId); return sendMessage(env, chatId, "⚠️ Tracker not found.", mainKeyboard()); }
+    const types = parseTypes(textValue);
+    await env.DB.prepare("UPDATE trackers SET types_json = ? WHERE id = ?").bind(JSON.stringify(types), trackerId).run();
+    const updated = await env.DB.prepare("SELECT * FROM trackers WHERE id = ?").bind(trackerId).first();
+    await clearState(env, chatId);
+    await sendMessage(env, chatId, `✅ Types updated!\n\n${formatTracker(updated)}`, mainKeyboard());
+    return;
+  }
   await clearState(env, chatId);
+}
+
+async function handleCallback(cb, env) {
+  const chatId = String(cb.message.chat.id);
+  const messageId = cb.message.message_id;
+  const [action, a1, a2] = String(cb.data || "").split("|");
+
+  try {
+    if (action === "r") {
+      await refreshAlert(env, cb, chatId, Number(a1), a2);
+      return;
+    }
+    if (action === "d") {
+      const result = await env.DB.prepare("DELETE FROM trackers WHERE id = ? AND chat_id = ?").bind(Number(a1), chatId).run();
+      await env.DB.prepare("DELETE FROM alert_messages WHERE tracker_id = ?").bind(Number(a1)).run();
+      await answerCallback(env, cb.id, result.meta.changes ? `🗑 Tracker #${a1} deleted` : "Not found");
+      await sendTrackerList(env, chatId, messageId);
+      return;
+    }
+    if (action === "e") {
+      await answerCallback(env, cb.id);
+      await editMessage(env, chatId, messageId, `✏️ <b>Edit tracker #${a1}</b>\nWhat would you like to change?`, {
+        inline_keyboard: [[{ text: "📅 Dates", callback_data: `ed|${a1}` }, { text: "🎫 Types", callback_data: `et|${a1}` }], [{ text: "⬅️ Back", callback_data: "l" }]],
+      });
+      return;
+    }
+    if (action === "ed" || action === "et") {
+      const tracker = await env.DB.prepare("SELECT * FROM trackers WHERE id = ? AND chat_id = ?").bind(Number(a1), chatId).first();
+      if (!tracker) { await answerCallback(env, cb.id, "Tracker not found"); return; }
+      if (action === "ed") {
+        await setState(env, chatId, "awaiting_edit_dates", { trackerId: tracker.id });
+        await answerCallback(env, cb.id);
+        await sendMessage(env, chatId, `📅 Send the new dates for tracker <b>#${tracker.id}</b>.\n\nExamples:\n2026-08-18\n2026-08-18, 2026-08-20\n2026-08-18..2026-08-21\ntomorrow`, dateKeyboard());
+      } else {
+        await setState(env, chatId, "awaiting_edit_types", { trackerId: tracker.id });
+        await answerCallback(env, cb.id);
+        await sendMessage(env, chatId, `🎫 Send the new ticket types for tracker <b>#${tracker.id}</b>, or <b>any</b>.\n\n${TYPE_HELP}`, typeKeyboard());
+      }
+      return;
+    }
+    if (action === "l") {
+      await answerCallback(env, cb.id);
+      await sendTrackerList(env, chatId, messageId);
+      return;
+    }
+    await answerCallback(env, cb.id);
+  } catch (err) {
+    console.error("callback failed:", (err && err.stack) || String(err));
+    await answerCallback(env, cb.id, `⚠️ ${String(err.message || err).slice(0, 150)}`).catch(() => {});
+  }
+}
+
+async function sendTrackerList(env, chatId, editMessageId) {
+  const rows = await env.DB.prepare("SELECT * FROM trackers WHERE chat_id = ? ORDER BY archived ASC, active DESC, id ASC").bind(chatId).all();
+  const all = rows.results;
+  const active = all.filter((r) => r.active && !r.archived);
+  const paused = all.filter((r) => !r.active && !r.archived);
+  const archived = all.filter((r) => r.archived);
+
+  if (!all.length) {
+    const msg = "📋 No trackers yet.\nTap /newtracker to create one.";
+    if (editMessageId) return editMessage(env, chatId, editMessageId, msg);
+    return sendMessage(env, chatId, msg, mainKeyboard());
+  }
+
+  const parts = ["📋 <b>Your Trackers</b>"];
+  if (active.length) {
+    parts.push("\n<b>🟢 Active</b>", active.map((r) => formatTracker(r)).join("\n\n"));
+  }
+  if (paused.length) {
+    parts.push("\n<b>⏸ Paused</b>", paused.map((r) => formatTracker(r)).join("\n\n"));
+  }
+  if (archived.length) {
+    parts.push("\n<b>🗄 Archived</b>", archived.map((r) => formatTracker(r)).join("\n\n"));
+  }
+
+  const keyboard = active.map((r) => ([
+    { text: `✏️ Edit #${r.id}`, callback_data: `e|${r.id}` },
+    { text: `🗑 Delete #${r.id}`, callback_data: `d|${r.id}` },
+  ]));
+
+  const markup = keyboard.length ? { inline_keyboard: keyboard } : undefined;
+  const msg = parts.join("\n");
+  if (editMessageId) return editMessage(env, chatId, editMessageId, msg, markup);
+  return sendMessage(env, chatId, msg, mainKeyboard());
+}
+
+async function refreshAlert(env, cb, chatId, trackerId, travelDate) {
+  const tracker = await env.DB.prepare("SELECT * FROM trackers WHERE id = ? AND chat_id = ?").bind(trackerId, chatId).first();
+  if (!tracker) return answerCallback(env, cb.id, "⚠️ Tracker not found");
+  if (tracker.archived) return answerCallback(env, cb.id, "🗄 Tracker is archived");
+  const session = await createEticketSession(env);
+  const trains = await findTrains(env, session, tracker.from_code, tracker.to_code, travelDate);
+  const matches = collectAvailability(trains, trackerTypes(tracker));
+  const rendered = renderAlert(tracker, travelDate, matches);
+  const stored = await env.DB.prepare("SELECT * FROM alert_messages WHERE tracker_id = ? AND travel_date = ?").bind(trackerId, travelDate).first();
+  if (stored && stored.content === rendered.text) {
+    await answerCallback(env, cb.id, "✅ Already up to date");
+    return;
+  }
+  try {
+    await editMessage(env, chatId, cb.message.message_id, rendered.text, refreshKeyboard(trackerId, travelDate));
+  } catch (editErr) {
+    if (/not modified/i.test(editErr.message)) { await answerCallback(env, cb.id, "✅ Already up to date"); return; }
+    throw editErr;
+  }
+  await saveAlertMessage(env, trackerId, travelDate, cb.message.message_id, rendered);
+  await answerCallback(env, cb.id, matches.length ? "✅ Updated" : "Updated — no tickets right now");
 }
 
 async function addTrackerFromParsed(env, chatId, parsed) {
@@ -213,12 +352,17 @@ async function addTrackerFromParsed(env, chatId, parsed) {
     createdAt,
   ).run();
   const row = await env.DB.prepare("SELECT * FROM trackers WHERE chat_id = ? AND active = 1 ORDER BY id DESC LIMIT 1").bind(chatId).first();
-  await sendMessage(env, chatId, `Tracking added:\n${formatTracker(row)}`, mainKeyboard());
+  await sendMessage(env, chatId, `✅ Tracker added!\n\n${formatTracker(row)}`, mainKeyboard());
 }
 
 async function checkTrackers(env) {
+  const nowIso = new Date().toISOString();
+  const today = todayIso();
+
+  await env.DB.prepare("UPDATE trackers SET archived = 1, active = 0 WHERE archived = 0 AND active = 1 AND (SELECT MAX(value) FROM json_each(trackers.dates_json)) < ?").bind(today).run();
+
   const limit = Number(env.CHECK_LIMIT || DEFAULT_CHECK_LIMIT);
-  const rows = await env.DB.prepare("SELECT * FROM trackers WHERE active = 1 ORDER BY COALESCE(last_checked_at, '') ASC, id ASC LIMIT ?").bind(limit).all();
+  const rows = await env.DB.prepare("SELECT * FROM trackers WHERE active = 1 AND archived = 0 ORDER BY COALESCE(last_checked_at, '') ASC, id ASC LIMIT ?").bind(limit).all();
   if (!rows.results.length) return;
 
   const session = await createEticketSession(env);
@@ -226,27 +370,46 @@ async function checkTrackers(env) {
     try {
       const dates = trackerDates(row);
       const types = trackerTypes(row);
-      const byDate = new Map();
       for (const travelDate of dates) {
         const trains = await findTrains(env, session, row.from_code, row.to_code, travelDate);
         const matches = collectAvailability(trains, types);
-        const unseen = [];
-        for (const match of matches) {
-          const inserted = await markAlertSeen(env, row.id, travelDate, match.key);
-          if (inserted) unseen.push(match);
+        const rendered = renderAlert(row, travelDate, matches);
+        const stored = await env.DB.prepare("SELECT * FROM alert_messages WHERE tracker_id = ? AND travel_date = ?").bind(row.id, travelDate).first();
+        if (!stored) {
+          if (matches.length) {
+            try {
+              const sent = await sendMessage(env, row.chat_id, rendered.text, refreshKeyboard(row.id, travelDate));
+              await saveAlertMessage(env, row.id, travelDate, sent.message_id, rendered);
+            } catch (sendErr) {
+              console.error("alert send failed:", sendErr.message);
+            }
+          }
+        } else if (stored.fingerprint !== rendered.fingerprint || Date.now() - Date.parse(stored.updated_at) > ALERT_REFRESH_MS) {
+          if (stored.content !== rendered.text) {
+            try {
+              await editMessage(env, row.chat_id, stored.message_id, rendered.text, refreshKeyboard(row.id, travelDate));
+            } catch (editErr) {
+              if (/not modified/i.test(editErr.message)) { /* no-op */ } else { console.error("alert edit failed:", editErr.message); }
+            }
+          }
+          await saveAlertMessage(env, row.id, travelDate, stored.message_id, rendered);
         }
-        if (unseen.length) byDate.set(travelDate, unseen);
       }
-      for (const [travelDate, matches] of byDate) {
-        await sendMessage(env, row.chat_id, formatAlert(row, travelDate, matches));
-      }
-      await env.DB.prepare("UPDATE trackers SET last_checked_at = ?, last_error = NULL WHERE id = ?").bind(new Date().toISOString(), row.id).run();
+      await env.DB.prepare("UPDATE trackers SET last_checked_at = ?, last_error = NULL, last_error_at = NULL WHERE id = ?").bind(nowIso, row.id).run();
     } catch (err) {
       const message = String(err.message || err).slice(0, 500);
-      if (message !== row.last_error) {
-        await sendMessage(env, row.chat_id, `Tracker #${row.id} error: ${escapeHtml(message)}`);
+      const maintenance = /техническ|technical break|eticket 424/i.test(message);
+      if (maintenance) {
+        await env.DB.prepare("UPDATE trackers SET last_checked_at = ? WHERE id = ?").bind(nowIso, row.id).run();
+      } else {
+        const lastAt = row.last_error_at ? Date.parse(row.last_error_at) : 0;
+        if (!lastAt || Date.now() - lastAt > ERROR_NOTIFY_COOLDOWN_MS) {
+          await sendMessage(env, row.chat_id, `⚠️ <b>Tracker #${row.id}</b>\n${escapeHtml(prettifyError(message))}`);
+          await env.DB.prepare("UPDATE trackers SET last_checked_at = ?, last_error = ?, last_error_at = ? WHERE id = ?").bind(nowIso, message, nowIso, row.id).run();
+        } else {
+          await env.DB.prepare("UPDATE trackers SET last_checked_at = ?, last_error = ? WHERE id = ?").bind(nowIso, message, row.id).run();
+        }
       }
-      await env.DB.prepare("UPDATE trackers SET last_checked_at = ?, last_error = ? WHERE id = ?").bind(new Date().toISOString(), message, row.id).run();
     }
   }
 }
@@ -287,7 +450,7 @@ async function eticketPost(env, session, path, payload, extraHeaders = {}) {
   });
   const textValue = await res.text();
   if (!res.ok) throw new Error(`eticket ${res.status}: ${textValue.slice(0, 300)}`);
-  if (!textValue) return null; // eticket returns 204 with empty body when nothing matches
+  if (!textValue) return null;
   return JSON.parse(textValue);
 }
 
@@ -307,8 +470,6 @@ async function resolveStation(env, value) {
   return stations[0];
 }
 
-// Wizard station picking: returns a station {code, name}, {matches: [...]}
-// when the input is ambiguous, or null when nothing matches.
 async function pickStation(env, value) {
   const cleaned = String(value || "").trim();
   const buttonMatch = cleaned.match(/^(\d{7})\s*-\s*(.+)$/);
@@ -358,18 +519,6 @@ function collectAvailability(trains, wantedTypes) {
     }
   }
   return matches;
-}
-
-async function markAlertSeen(env, trackerId, travelDate, fingerprint) {
-  try {
-    await env.DB.prepare("INSERT INTO alerts (tracker_id, travel_date, fingerprint, first_seen_at) VALUES (?, ?, ?, ?)")
-      .bind(trackerId, travelDate, fingerprint, new Date().toISOString())
-      .run();
-    return true;
-  } catch (err) {
-    if (String(err.message || err).includes("UNIQUE")) return false;
-    throw err;
-  }
 }
 
 function parseTrackCommand(textValue) {
@@ -475,7 +624,8 @@ function trackerDates(row) {
 function formatTracker(row) {
   const dates = trackerDates(row);
   const types = trackerTypes(row);
-  return `#${row.id} ${escapeHtml(row.from_name)} -> ${escapeHtml(row.to_name)} dates: ${escapeHtml(formatDates(dates))}, types: ${escapeHtml(types.join(", ") || "any")}`;
+  const statusIcon = row.archived ? "🗄" : row.active ? "🟢" : "⏸";
+  return `${statusIcon} <b>#${row.id}</b> ${escapeHtml(row.from_name)} → ${escapeHtml(row.to_name)}\n📅 ${escapeHtml(formatDates(dates))}  🪑 ${escapeHtml(types.join(", ") || "any")}`;
 }
 
 function formatDates(dates) {
@@ -485,28 +635,54 @@ function formatDates(dates) {
   return dates.join(", ");
 }
 
-function formatAlert(row, travelDate, matches) {
-  const lines = [
-    "Tickets available",
-    `${escapeHtml(row.from_name)} -> ${escapeHtml(row.to_name)}`,
-    `Date: ${travelDate}`,
-    "",
-  ];
-  for (const item of matches.slice(0, 12)) {
-    const tariffs = (item.tariffs || []).slice(0, 4).map((tariff) => {
-      let textValue = String(tariff.classServiceType || "class");
-      if (tariff.freeSeats !== undefined) textValue += `: ${tariff.freeSeats} seats`;
-      if (tariff.tariff !== undefined) textValue += `, ${tariff.tariff} UZS`;
-      return textValue;
+function renderAlert(row, travelDate, matches) {
+  const fingerprint = matches.map((m) => `${m.key}#${m.freeSeats}`).join(";");
+  const stamp = new Date().toISOString().slice(11, 16);
+  const header = matches.length ? "🟢 <b>Tickets available</b>" : "🔴 <b>No tickets right now</b>";
+  const lines = [header, `🚂 ${escapeHtml(row.from_name)} → ${escapeHtml(row.to_name)}`, `📅 ${travelDate}`, ""];
+
+  for (const item of matches.slice(0, 10)) {
+    const tariffLines = (item.tariffs || []).slice(0, 3).map((t) => {
+      let s = String(t.classServiceType || "class");
+      if (t.freeSeats !== undefined) s += `: ${t.freeSeats}`;
+      if (t.tariff !== undefined && Number.isFinite(Number(t.tariff))) s += ` • ${Number(t.tariff).toLocaleString("en-US")} UZS`;
+      return s;
     });
-    lines.push(`${escapeHtml(item.trainNumber)} ${escapeHtml(item.brand)} | ${escapeHtml(item.departure)} -> ${escapeHtml(item.arrival)}`);
-    lines.push(`${escapeHtml(item.carType)}: ${item.freeSeats} free`);
-    if (tariffs.length) lines.push(escapeHtml(tariffs.join("; ")));
+    lines.push(`<b>${escapeHtml(item.trainNumber)}</b>${item.brand ? ` • ${escapeHtml(item.brand)}` : ""}`);
+    lines.push(`🪑 ${escapeHtml(item.carType)} — <b>${item.freeSeats}</b> free`);
+    if (tariffLines.length) lines.push(`💰 ${escapeHtml(tariffLines.join("  ·  "))}`);
     if (item.comment) lines.push(escapeHtml(item.comment));
     lines.push("");
   }
-  if (matches.length > 12) lines.push(`...and ${matches.length - 12} more matches.`);
-  return lines.join("\n").trim();
+  if (matches.length > 10) lines.push(`…and ${matches.length - 10} more`, "");
+  lines.push(`🔄 Updated ${stamp} UTC · Tracker #${row.id}`);
+  const text = lines.join("\n").trim();
+  return { text, fingerprint };
+}
+
+function prettifyError(message) {
+  const jsonStart = message.indexOf("{");
+  if (jsonStart > 0) {
+    try {
+      const parsed = JSON.parse(message.slice(jsonStart));
+      if (parsed.messageEn) return `Eticket maintenance (${parsed.startTime}–${parsed.endTime})`;
+      if (parsed.error) return `Eticket error: ${JSON.stringify(parsed.error).slice(0, 200)}`;
+    } catch (_err) {}
+  }
+  return message;
+}
+
+function shortTime(value) {
+  const m = String(value || "").match(/(\d{2}:\d{2})/);
+  return m ? m[1] : String(value || "");
+}
+
+async function saveAlertMessage(env, trackerId, travelDate, messageId, rendered) {
+  await env.DB.prepare(`
+    INSERT INTO alert_messages (tracker_id, travel_date, message_id, fingerprint, content, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(tracker_id, travel_date) DO UPDATE SET message_id = excluded.message_id, fingerprint = excluded.fingerprint, content = excluded.content, updated_at = excluded.updated_at
+  `).bind(trackerId, travelDate, messageId, rendered.fingerprint, rendered.text, new Date().toISOString()).run();
 }
 
 async function getState(env, chatId) {
@@ -549,8 +725,34 @@ async function sendMessage(env, chatId, textValue, replyMarkup) {
   });
 }
 
+async function editMessage(env, chatId, messageId, textValue, replyMarkup) {
+  return telegramApi(env, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text: textValue,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+  });
+}
+
+async function answerCallback(env, callbackId, textValue) {
+  return telegramApi(env, "answerCallbackQuery", {
+    callback_query_id: callbackId,
+    ...(textValue ? { text: textValue, show_alert: false } : {}),
+  });
+}
+
+function refreshKeyboard(trackerId, travelDate) {
+  return { inline_keyboard: [[{ text: "🔄 Refresh", callback_data: `r|${trackerId}|${travelDate}` }]] };
+}
+
 function mainKeyboard() {
   return { keyboard: [[{ text: "/newtracker" }, { text: "/list" }], [{ text: "/types" }, { text: "/cancel" }]], resize_keyboard: true };
+}
+
+function stateKeyboard() {
+  return { keyboard: [[{ text: "/cancel" }]], resize_keyboard: true, one_time_keyboard: true };
 }
 
 function stationKeyboard(labels, excludeLabel) {
@@ -592,7 +794,7 @@ function canonicalCarType(value) {
 }
 
 function normalizeType(value) {
-  return String(value || "").trim().toLowerCase().replace(/[ʼ‘`]/g, "'").replace(/\s+/g, " ");
+  return String(value || "").trim().toLowerCase().replace(/[ʼ'`]/g, "'").replace(/\s+/g, " ");
 }
 
 function todayIso() {
